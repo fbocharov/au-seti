@@ -12,8 +12,8 @@ if(NOT CMAKE_BUILD_TYPE)
 	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release")
 endif()
 
-set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g3 -DDEBUG -D_DEBUG -Wall -pedantic -Wno-long-long -std=c++1y -fsanitize=thread" CACHE STRING "Debug options." FORCE)
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -fno-omit-frame-pointer -D_NDEBUG -Wall -pedantic -Wno-long-long -std=c++1y" CACHE STRING "Release options." FORCE)
+set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g3 -DDEBUG -D_DEBUG -Wall -Werror -pedantic -Wno-long-long -std=c++1y -fsanitize=thread" CACHE STRING "Debug options." FORCE)
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -fno-omit-frame-pointer -D_NDEBUG -Wall -Werror -pedantic -Wno-long-long -std=c++1y" CACHE STRING "Release options." FORCE)
 
 add_subdirectory(src)
 add_subdirectory(test)

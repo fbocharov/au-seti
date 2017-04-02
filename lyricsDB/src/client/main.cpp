@@ -1,9 +1,14 @@
+#include <common/message_io.h>
 #include <net/stream_socket.h>
+#include <protocol/protocol.h>
 
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
+#include <vector>
 
 void usage(std::string const & name)
 {
@@ -15,12 +20,68 @@ void usage(std::string const & name)
 
 void help()
 {
-	std::cerr << "  Supported commands:" << std::endl;
-	std::cerr << "    get <author>         get all songs of author <author>" << std::endl;
-	std::cerr << "    get <author> <song>  get song with name <song> of author <author>" << std::endl;
-	std::cerr << "    add <author> <song>  upload song from file <song> of author <author>" << std::endl;
-	std::cerr << "    help                 see this help" << std::endl;
-	std::cerr << "    exit                 stop using this app" << std::endl;
+	std::cerr << "  get <author>         get list of songs of author <author>" << std::endl;
+	std::cerr << "  get <author> <song>  get song with name <song> of author <author>" << std::endl;
+	std::cerr << "  add <author> <song>  upload song from file <song> of author <author>" << std::endl;
+	std::cerr << "  help                 see this help" << std::endl;
+	std::cerr << "  exit                 stop using this app" << std::endl;
+}
+
+bool validate_command(std::string const & command)
+{
+	return command == "get" || command == "add";
+}
+
+class requester {
+public:
+	explicit requester(client_socket_ptr socket)
+		: m_socket(socket)
+	{}
+
+	std::vector<std::string> request_get_song_list(std::string const & author)
+	{
+		auto request = std::make_shared<get_author_request>(author);
+		send_message(*m_socket, request);
+
+		auto response = recv_message(*m_socket);
+		(void) response;
+
+		return {};
+	}
+
+	std::string request_get_song(std::string const & author, std::string const & song)
+	{
+		auto request = std::make_shared<get_author_song_request>(author, song);
+		send_message(*m_socket, request);
+
+		auto response = recv_message(*m_socket);
+		(void) response;
+
+		return "";
+	}
+
+	std::string request_add_song(
+		std::string const & author,
+		std::string const & song,
+		std::string const & text)
+	{
+		auto request = std::make_shared<add_author_song_request>(author, song, text);
+		send_message(*m_socket, request);
+
+		auto response = recv_message(*m_socket);
+		(void) response;
+
+		return "";
+	}
+
+private:
+	client_socket_ptr m_socket;
+};
+
+std::string load_file(std::string const & path)
+{
+	std::ifstream stream(path);
+	return { std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>() };
 }
 
 void loop(client_socket_ptr socket)
@@ -33,6 +94,9 @@ void loop(client_socket_ptr socket)
 		std::cout << "> ";
 		std::getline(std::cin, command);
 
+		if (command.empty())
+			continue;
+
 		if ("help" == command) {
 			help();
 			continue;
@@ -40,6 +104,33 @@ void loop(client_socket_ptr socket)
 
 		if ("exit" == command)
 			break;
+
+		std::stringstream ss(command);
+
+		std::string cmd;
+		ss >> cmd;
+		if (!validate_command(cmd)) {
+			std::cerr << "invalid command, type `help` to see list of supported commands" << std::endl;
+			continue;
+		}
+
+		std::string author;
+		ss >> author;
+		if (author.empty()) {
+			std::cerr << "invalid command arguments, type `help` to see list of supported commands" << std::endl;
+			continue;
+		}
+
+		std::string song;
+		ss >> song;
+		if (song.empty()) {
+			std::cout << "get all songs request!" << std::endl;
+		} else {
+			if (cmd == "get")
+				std::cout << "get one song request!" << std::endl;
+			else // cmd == "add"
+				std::cout << "add song request!" << std::endl;
+		}
 	}
 	std::cout << std::endl;
 }
@@ -53,6 +144,7 @@ int main(int argc, char * argv[])
 
 	std::string address = "127.0.0.1";
 	uint16_t port = 40001;
+	(void) port;
 
 	if (argc >= 2) {
 		address = argv[1];

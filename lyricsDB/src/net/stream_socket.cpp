@@ -100,7 +100,7 @@ public:
 			throw socket_exception("socket not connected");
 
 		ssize_t sendSize = ::send(m_descriptor, buf, size, 0);
-		if (sendSize < 0 || sendSize != size)
+		if (sendSize < 0 || size_t(sendSize) != size)
 			throw_errno("failed to send " + std::to_string(size) + " bytes");
 	}
 
@@ -110,7 +110,7 @@ public:
 			throw socket_exception("socket not connected");
 
 		ssize_t recvSize = ::recv(m_descriptor, buf, size, 0);
-		if (recvSize < 0 || recvSize != size)
+		if (recvSize < 0 || size_t(recvSize) != size)
 			throw_errno("failed to recv " + std::to_string(size) + " bytes");
 	}
 
