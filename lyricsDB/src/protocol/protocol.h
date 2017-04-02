@@ -119,7 +119,7 @@ private:
 
 class add_author_song_response: public message {
 public:
-	add_author_song_response(bool result);
+	add_author_song_response(const std::__cxx11::string &result);
 
 	message_bytes serialize() const override;
 	static message_ptr deserialize(message_bytes const & bytes);
@@ -127,7 +127,7 @@ public:
 	void accept(response_visitor & v) override;
 
 private:
-	bool m_result;
+	std::string m_result;
 };
 
 ///////////////////////////////////////////////////////////////////////////////

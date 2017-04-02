@@ -3,6 +3,75 @@
 #include <algorithm>
 #include <cstring>
 
+namespace {
+
+void serialize_one_string(std::string const & str, message_bytes & bytes)
+{
+	uint8_t * data = bytes.data();
+	uint64_t offset = 1; // skip message type
+	uint64_t size = str.length();
+
+	// write size
+	memcpy(data + offset, &size, sizeof(size));
+	offset += sizeof(size);
+
+	// write author
+	memcpy(data + offset, str.data(), size);
+}
+
+std::string deserialize_one_string(message_bytes const & bytes)
+{
+	uint8_t const * data = bytes.data() + 1; // skip message type
+
+	uint64_t size = 0;
+	memcpy(&size, data, sizeof(size));
+	data += sizeof(size);
+
+	return std::string(data, data + size);
+}
+
+void serialize_many_strings(std::vector<std::string> const & strings, message_bytes & bytes)
+{
+	uint64_t stringCount = strings.size();
+	uint8_t * data = bytes.data();
+	uint64_t offset = 1; // skip message type
+	memcpy(data + offset, &stringCount, sizeof(stringCount));
+	offset += sizeof(stringCount);
+
+	for (auto const & str: strings) {
+		uint64_t size = str.size();
+		memcpy(data + offset, &size, sizeof(size));
+		offset += sizeof(size);
+
+		memcpy(data + offset, str.data(), size);
+		offset += size;
+	}
+}
+
+std::vector<std::string> deserialize_many_strings(message_bytes const & bytes)
+{
+	uint8_t const * data = bytes.data() + 1; // skip message type
+
+	uint64_t stringCount = 0;
+	memcpy(&stringCount, data, sizeof(stringCount));
+	data += sizeof(stringCount);
+
+	std::vector<std::string> strings;
+	for (uint64_t i = 0; i < stringCount; ++i) {
+		uint64_t size = 0;
+		memcpy(&size, data, sizeof(size));
+		data += sizeof(size);
+
+		strings.emplace_back(data, data + size);
+		data += size;
+	}
+
+	return strings;
+}
+
+} // namespace
+
+
 get_author_request::get_author_request(std::string const & author)
 	: m_author(author)
 {}
@@ -12,17 +81,7 @@ message_bytes get_author_request::serialize() const
 	message_bytes bytes(1 + 8 + m_author.length());
 
 	bytes[0] = uint8_t(message_type::GET_AUTHOR_REQUEST);
-
-	uint8_t * data = bytes.data();
-	uint64_t offset = 1;
-	uint64_t size = m_author.length();
-
-	// write size
-	memcpy(data + offset, &size, sizeof(size));
-	offset += sizeof(size);
-
-	// write author
-	memcpy(data + offset, m_author.data(), size);
+	serialize_one_string(m_author, bytes);
 
 	return bytes;
 }
@@ -32,13 +91,7 @@ message_ptr get_author_request::deserialize(message_bytes const & bytes)
 	if (message_type(bytes[0]) != message_type::GET_AUTHOR_REQUEST)
 		throw std::runtime_error("invalid message type");
 
-	uint8_t const * data = bytes.data() + 1;
-
-	uint64_t size = 0;
-	memcpy(&size, data, sizeof(size));
-	data += sizeof(size);
-
-	return std::make_shared<get_author_request>(std::string(data, data + size));
+	return std::make_shared<get_author_request>(deserialize_one_string(bytes));
 }
 
 void get_author_request::accept(request_visitor & v)
@@ -61,19 +114,7 @@ message_bytes get_author_response::serialize() const
 	message_bytes bytes(1 + 8 + 8 * songCount + commonSize);
 	bytes[0] = uint8_t(message_type::GET_AUTHOR_RESPONSE);
 
-	uint8_t * data = bytes.data();
-	uint64_t offset = 1;
-	memcpy(data + offset, &songCount, sizeof(songCount));
-	offset += sizeof(songCount);
-
-	for (const auto& song: m_songs) {
-		uint64_t size = song.size();
-		memcpy(data + offset, &size, sizeof(size));
-		offset += sizeof(size);
-
-		memcpy(data + offset, song.data(), size);
-		offset += size;
-	}
+	serialize_many_strings(m_songs, bytes);
 
 	return bytes;
 }
@@ -81,25 +122,9 @@ message_bytes get_author_response::serialize() const
 message_ptr get_author_response::deserialize(message_bytes const & bytes)
 {
 	if (bytes[0] != uint8_t(message_type::GET_AUTHOR_RESPONSE))
-		throw std::runtime_error("invalid message type");;
+		throw std::runtime_error("invalid message type");
 
-	uint8_t const * data = bytes.data() + 1;
-
-	uint64_t songCount = 0;
-	memcpy(&songCount, data, sizeof(songCount));
-	data += sizeof(songCount);
-
-	std::vector<std::string> songs;
-	for (uint64_t i = 0; i < songCount; ++i) {
-		uint64_t size = 0;
-		memcpy(&size, data, sizeof(size));
-		data += sizeof(size);
-
-		songs.emplace_back(data, data + size);
-		data += size;
-	}
-
-	return std::make_shared<get_author_response>(songs);
+	return std::make_shared<get_author_response>(deserialize_many_strings(bytes));
 }
 
 void get_author_response::accept(response_visitor & v)
@@ -117,8 +142,24 @@ get_author_song_request::get_author_song_request(std::string const & author, std
 
 message_bytes get_author_song_request::serialize() const
 {
-	// TODO: implement!
-	return {};
+	message_bytes bytes(1 + 8 + 8 + m_author.length() + 8 + m_song.length());
+
+	bytes[0] = uint8_t(message_type::GET_AUTHOR_SONG_REQUEST);
+	serialize_many_strings({ m_author, m_song }, bytes);
+
+	return bytes;
+}
+
+message_ptr get_author_song_request::deserialize(message_bytes const & bytes)
+{
+	if (bytes[0] != uint8_t(message_type::GET_AUTHOR_SONG_REQUEST))
+		throw std::runtime_error("invalid message type");;
+
+	auto strings = deserialize_many_strings(bytes);
+	if (strings.size() != 2)
+		throw std::runtime_error("not enough values to unpack");
+
+	return std::make_shared<get_author_song_request>(strings[0], strings[1]);
 }
 
 void get_author_song_request::accept(request_visitor & v)
@@ -133,8 +174,20 @@ get_author_song_response::get_author_song_response(std::string const & text)
 
 message_bytes get_author_song_response::serialize() const
 {
-	// TODO: implement!
-	return {};
+	message_bytes bytes(1 + 8 + m_text.length());
+
+	bytes[0] = uint8_t(message_type::GET_AUTHOR_SONG_RESPONSE);
+	serialize_one_string(m_text, bytes);
+
+	return bytes;
+}
+
+message_ptr get_author_song_response::deserialize(message_bytes const & bytes)
+{
+	if (bytes[0] != uint8_t(message_type::GET_AUTHOR_SONG_RESPONSE))
+		throw std::runtime_error("invalid message type");;
+
+	return std::make_shared<get_author_song_response>(deserialize_one_string(bytes));
 }
 
 void get_author_song_response::accept(response_visitor & v)
@@ -155,8 +208,27 @@ add_author_song_request::add_author_song_request(
 
 message_bytes add_author_song_request::serialize() const
 {
-	// TODO: implement!
-	return {};
+	message_bytes bytes(1 + 8 +
+						8 + m_author.length() +
+						8 + m_song.length() +
+						8 + m_text.length());
+
+	bytes[0] = uint8_t(message_type::ADD_AUTHOR_SONG_REQUEST);
+	serialize_many_strings({ m_author, m_song, m_text }, bytes);
+
+	return bytes;
+}
+
+message_ptr add_author_song_request::deserialize(message_bytes const & bytes)
+{
+	if (bytes[0] != uint8_t(message_type::ADD_AUTHOR_SONG_REQUEST))
+		throw std::runtime_error("invalid message type");;
+
+	auto strings = deserialize_many_strings(bytes);
+	if (strings.size() != 3)
+		throw std::runtime_error("not enough values to unpack");
+
+	return std::make_shared<add_author_song_request>(strings[0], strings[1], strings[2]);
 }
 
 void add_author_song_request::accept(request_visitor & v)
@@ -165,14 +237,26 @@ void add_author_song_request::accept(request_visitor & v)
 }
 
 
-add_author_song_response::add_author_song_response(bool result)
+add_author_song_response::add_author_song_response(std::string const & result)
 	: m_result(result)
 {}
 
 message_bytes add_author_song_response::serialize() const
 {
-	// TODO: implement!
-	return {};
+	message_bytes bytes(1 + 8 + m_result.length());
+
+	bytes[0] = uint8_t(message_type::ADD_AUTHOR_SONG_RESPONSE);
+	serialize_one_string(m_result, bytes);
+
+	return bytes;
+}
+
+message_ptr add_author_song_response::deserialize(message_bytes const & bytes)
+{
+	if (message_type(bytes[0]) != message_type::ADD_AUTHOR_SONG_RESPONSE)
+		throw std::runtime_error("invalid message type");
+
+	return std::make_shared<get_author_request>(deserialize_one_string(bytes));
 }
 
 void add_author_song_response::accept(response_visitor & v)
