@@ -32,6 +32,27 @@ bool validate_command(std::string const & command)
 	return command == "get" || command == "add";
 }
 
+struct server_response_visitor: public response_visitor {
+
+	void visit(get_song_list_response & request) override
+	{
+		songs = request.get_songs();
+	}
+
+	void visit(get_song_response & request) override
+	{
+		songs = { request.get_text() };
+	}
+
+	void visit(add_song_response & request) override
+	{
+		result = request.get_result();
+	}
+
+	std::string result;
+	std::vector<std::string> songs;
+};
+
 class requester {
 public:
 	explicit requester(client_socket_ptr socket)
@@ -40,7 +61,7 @@ public:
 
 	std::vector<std::string> request_get_song_list(std::string const & author)
 	{
-		auto request = std::make_shared<get_author_request>(author);
+		auto request = std::make_shared<get_song_list_request>(author);
 		send_message(*m_socket, request);
 
 		auto response = recv_message(*m_socket);
@@ -51,13 +72,14 @@ public:
 
 	std::string request_get_song(std::string const & author, std::string const & song)
 	{
-		auto request = std::make_shared<get_author_song_request>(author, song);
+		auto request = std::make_shared<get_song_request>(author, song);
 		send_message(*m_socket, request);
 
 		auto response = recv_message(*m_socket);
-		(void) response;
+		server_response_visitor v;
+		response->accept(v);
 
-		return "";
+		return v.songs.front();
 	}
 
 	std::string request_add_song(
@@ -65,13 +87,14 @@ public:
 		std::string const & song,
 		std::string const & text)
 	{
-		auto request = std::make_shared<add_author_song_request>(author, song, text);
+		auto request = std::make_shared<add_song_request>(author, song, text);
 		send_message(*m_socket, request);
 
 		auto response = recv_message(*m_socket);
-		(void) response;
+		server_response_visitor v;
+		response->accept(v);
 
-		return "";
+		return v.result;
 	}
 
 private:
@@ -90,6 +113,7 @@ void loop(client_socket_ptr socket)
 	std::cout << "Type `help` to see list of supported commands." << std::endl;
 
 	std::string command;
+	requester r(socket);
 	while (std::cin) {
 		std::cout << "> ";
 		std::getline(std::cin, command);
@@ -124,12 +148,22 @@ void loop(client_socket_ptr socket)
 		std::string song;
 		ss >> song;
 		if (song.empty()) {
-			std::cout << "get all songs request!" << std::endl;
+			for (auto& song: r.request_get_song_list(author)) {
+				std::cout << song << std::endl;
+				std::cout  << "==============================" << std::endl;
+			}
 		} else {
 			if (cmd == "get")
-				std::cout << "get one song request!" << std::endl;
-			else // cmd == "add"
-				std::cout << "add song request!" << std::endl;
+				std::cout << r.request_get_song(author, song) << std::endl;
+			else { // cmd == "add"
+				std::string textFile;
+				ss >> textFile;
+				if (textFile.empty()) {
+					std::cerr << "you should specify file with text" << std::endl;
+					continue;
+				}
+				std::cout << r.request_add_song(author, song, load_file(textFile)) << std::endl;
+			}
 		}
 	}
 	std::cout << std::endl;

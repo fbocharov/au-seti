@@ -8,4 +8,8 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 
 add_executable(${PROJECT_NAME} ${SOURCES})
 
-target_link_libraries(${PROJECT_NAME} netlib)
+target_link_libraries(${PROJECT_NAME}
+	commonlib
+	netlib
+	protolib
+)
