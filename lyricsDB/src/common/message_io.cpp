@@ -4,7 +4,7 @@
 #include <cassert>
 #include <cstring>
 
-size_t constexpr BUCKET_SIZE = 1024;
+uint64_t constexpr BUCKET_SIZE = 1024;
 
 void send_message(stream_socket & socket, message const & message)
 {
