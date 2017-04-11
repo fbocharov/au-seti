@@ -121,10 +121,16 @@ int main(int argc, char * argv[])
 		auto client = ssocket->accept_one_client();
 		std::cerr << "accepted connection, start handling it" << std::endl;
 		std::thread t([client, &db] () {
-			auto request = recv_message(*client);
-			client_request_visitor v(db);
-			request->accept(v);
-			send_message(*client, *v.msg);
+			try {
+				while (true) {
+					auto request = recv_message(*client);
+					client_request_visitor v(db);
+					request->accept(v);
+					send_message(*client, *v.msg);
+				}
+			} catch (socket_exception const & e) {
+				std::cerr << "error interact client: " << std::endl;
+			}
 		});
 		t.detach();
 	}
