@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <iostream>
 
 constexpr auto TCP_SERVER_SOCKET_BACKLOG_LENGTH = 128;
 
@@ -20,6 +19,21 @@ protected:
 	with_descriptor(int descriptor)
 		: m_descriptor(descriptor)
 	{}
+
+	with_descriptor(with_descriptor const &) = delete;
+	with_descriptor & operator=(with_descriptor const &) = delete;
+
+	with_descriptor(with_descriptor && other)
+	{
+		m_descriptor = other.m_descriptor;
+		other.m_descriptor = -1;
+	}
+
+	with_descriptor & operator=(with_descriptor && other)
+	{
+		std::swap(m_descriptor, other.m_descriptor);
+		return *this;
+	}
 
 	~with_descriptor()
 	{
@@ -46,7 +60,7 @@ sockaddr_in create_addr(
 	uint16_t port,
 	bool passive)
 {
-	addrinfo hints = { 0 };
+	addrinfo hints;
 	addrinfo * result = nullptr;
 
 	hints.ai_addr = nullptr;
@@ -99,7 +113,7 @@ public:
 		if (!is_valid())
 			throw socket_exception("socket not connected");
 
-		ssize_t sendSize = ::send(m_descriptor, buf, size, 0);
+		ssize_t sendSize = ::send(m_descriptor, buf, size, MSG_NOSIGNAL);
 		if (sendSize < 0 || size_t(sendSize) != size)
 			throw_errno("failed to send " + std::to_string(size) + " bytes");
 	}
@@ -109,7 +123,7 @@ public:
 		if (!is_valid())
 			throw socket_exception("socket not connected");
 
-		ssize_t recvSize = ::recv(m_descriptor, buf, size, 0);
+		ssize_t recvSize = ::recv(m_descriptor, buf, size, MSG_NOSIGNAL);
 		if (recvSize < 0 || size_t(recvSize) != size)
 			throw_errno("failed to recv " + std::to_string(size) + " bytes");
 	}
@@ -158,7 +172,7 @@ public:
 		int client = ::accept(m_descriptor, nullptr, nullptr);
 		if (client < 0)
 			throw_errno("failed to accept client");
-		return std::make_shared<tcp_stream_client_socket>(client);
+		return socket_ptr(new tcp_stream_client_socket(client));
 	}
 };
 
@@ -169,7 +183,7 @@ client_socket_ptr make_client_socket(
 	uint16_t port,
 	bool connect)
 {
-	auto socket = std::make_shared<tcp_stream_client_socket>(hostname, port);
+	auto socket = client_socket_ptr(new tcp_stream_client_socket(hostname, port));
 	if (connect) {
 		socket->connect();
 	}
@@ -178,5 +192,5 @@ client_socket_ptr make_client_socket(
 
 server_socket_ptr make_server_socket(std::string const & hostname, uint16_t port)
 {
-	return std::make_shared<tcp_stream_server_socket>(hostname, port);
+	return server_socket_ptr(new tcp_stream_server_socket(hostname, port));
 }

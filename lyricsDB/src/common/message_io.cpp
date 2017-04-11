@@ -1,12 +1,14 @@
 #include "message_io.h"
 
 #include <algorithm>
+#include <cassert>
+#include <cstring>
 
 size_t constexpr BUCKET_SIZE = 1024;
 
-void send_message(stream_socket & socket, message_ptr message)
+void send_message(stream_socket & socket, message const & message)
 {
-	auto bytes = message->serialize();
+	auto bytes = message.serialize();
 
 	uint64_t size = bytes.size();
 	socket.send(&size, sizeof(size));
@@ -28,10 +30,10 @@ message_ptr recv_message(stream_socket & socket)
 	message_bytes bytes(size);
 	uint64_t recvSize = 0;
 	uint8_t * data = bytes.data();
-	while (size > 0) {
+	while (recvSize < size) {
 		uint64_t needRecv = std::min(BUCKET_SIZE, size - recvSize);
 		socket.recv(data + recvSize, needRecv);
-		size -= needRecv;
+		recvSize += needRecv;
 	}
 
 	return parse_message(bytes);

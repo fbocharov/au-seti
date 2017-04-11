@@ -7,16 +7,15 @@ namespace {
 
 void serialize_one_string(std::string const & str, message_bytes & bytes)
 {
-	uint8_t * data = bytes.data();
-	uint64_t offset = 1; // skip message type
+	uint8_t * data = bytes.data() + 1; // skip message type
 	uint64_t size = str.length();
 
 	// write size
-	memcpy(data + offset, &size, sizeof(size));
-	offset += sizeof(size);
+	memcpy(data, &size, sizeof(size));
+	data += sizeof(size);
 
 	// write author
-	memcpy(data + offset, str.data(), size);
+	memcpy(data, str.data(), size);
 }
 
 std::string deserialize_one_string(message_bytes const & bytes)
@@ -33,18 +32,17 @@ std::string deserialize_one_string(message_bytes const & bytes)
 void serialize_many_strings(std::vector<std::string> const & strings, message_bytes & bytes)
 {
 	uint64_t stringCount = strings.size();
-	uint8_t * data = bytes.data();
-	uint64_t offset = 1; // skip message type
-	memcpy(data + offset, &stringCount, sizeof(stringCount));
-	offset += sizeof(stringCount);
+	uint8_t * data = bytes.data() + 1; // skip message type
+	memcpy(data, &stringCount, sizeof(stringCount));
+	data += sizeof(stringCount);
 
 	for (auto const & str: strings) {
 		uint64_t size = str.size();
-		memcpy(data + offset, &size, sizeof(size));
-		offset += sizeof(size);
+		memcpy(data, &size, sizeof(size));
+		data += sizeof(size);
 
-		memcpy(data + offset, str.data(), size);
-		offset += size;
+		memcpy(data, str.data(), size);
+		data += size;
 	}
 }
 
@@ -91,7 +89,7 @@ message_ptr get_song_list_request::deserialize(message_bytes const & bytes)
 	if (message_type(bytes[0]) != message_type::GET_SONG_LIST_REQUEST)
 		throw std::runtime_error("invalid message type");
 
-	return std::make_shared<get_song_list_request>(deserialize_one_string(bytes));
+	return message_ptr(new get_song_list_request(deserialize_one_string(bytes)));
 }
 
 void get_song_list_request::accept(request_visitor & v)
@@ -107,8 +105,8 @@ get_song_list_response::get_song_list_response(std::vector<std::string> const & 
 message_bytes get_song_list_response::serialize() const
 {
 	uint64_t commonSize = 0;
-	std::for_each(m_songs.begin(), m_songs.end(),
-				  [&] (std::string const & str) { commonSize += str.size(); });
+	for (auto const & song: m_songs)
+		commonSize += song.size();
 
 	uint64_t songCount = m_songs.size();
 	message_bytes bytes(1 + 8 + 8 * songCount + commonSize);
@@ -124,7 +122,7 @@ message_ptr get_song_list_response::deserialize(message_bytes const & bytes)
 	if (bytes[0] != uint8_t(message_type::GET_SONG_LIST_RESPONSE))
 		throw std::runtime_error("invalid message type");
 
-	return std::make_shared<get_song_list_response>(deserialize_many_strings(bytes));
+	return message_ptr(new get_song_list_response(deserialize_many_strings(bytes)));
 }
 
 void get_song_list_response::accept(response_visitor & v)
@@ -159,7 +157,7 @@ message_ptr get_song_request::deserialize(message_bytes const & bytes)
 	if (strings.size() != 2)
 		throw std::runtime_error("not enough values to unpack");
 
-	return std::make_shared<get_song_request>(strings[0], strings[1]);
+	return message_ptr(new get_song_request(strings[0], strings[1]));
 }
 
 void get_song_request::accept(request_visitor & v)
@@ -187,7 +185,7 @@ message_ptr get_song_response::deserialize(message_bytes const & bytes)
 	if (bytes[0] != uint8_t(message_type::GET_SONG_RESPONSE))
 		throw std::runtime_error("invalid message type");;
 
-	return std::make_shared<get_song_response>(deserialize_one_string(bytes));
+	return message_ptr(new get_song_response(deserialize_one_string(bytes)));
 }
 
 void get_song_response::accept(response_visitor & v)
@@ -228,7 +226,7 @@ message_ptr add_song_request::deserialize(message_bytes const & bytes)
 	if (strings.size() != 3)
 		throw std::runtime_error("not enough values to unpack");
 
-	return std::make_shared<add_song_request>(strings[0], strings[1], strings[2]);
+	return message_ptr(new add_song_request(strings[0], strings[1], strings[2]));
 }
 
 void add_song_request::accept(request_visitor & v)
@@ -256,7 +254,7 @@ message_ptr add_song_response::deserialize(message_bytes const & bytes)
 	if (message_type(bytes[0]) != message_type::ADD_SONG_RESPONSE)
 		throw std::runtime_error("invalid message type");
 
-	return std::make_shared<get_song_list_request>(deserialize_one_string(bytes));
+	return message_ptr(new add_song_response(deserialize_one_string(bytes)));
 }
 
 void add_song_response::accept(response_visitor & v)

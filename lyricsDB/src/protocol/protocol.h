@@ -28,6 +28,7 @@ using message_bytes = std::vector<uint8_t>;
 struct message {
 	virtual ~message() = default;
 	virtual message_bytes serialize() const = 0;
+
 	virtual void accept(request_visitor &)
 	{
 		throw std::runtime_error("message type don't support request visitor");
@@ -59,7 +60,7 @@ private:
 
 class get_song_list_response: public message {
 public:
-	get_song_list_response(std::vector<std::string> const & songs);
+	explicit get_song_list_response(std::vector<std::string> const & songs);
 
 	message_bytes serialize() const override;
 	static message_ptr deserialize(message_bytes const & bytes);
@@ -69,7 +70,7 @@ public:
 	std::vector<std::string> const & get_songs() { return m_songs; }
 
 private:
-	std::vector<std::string> const & m_songs;
+	std::vector<std::string> m_songs;
 };
 
 ///////////////////////////////////////////////////////////////////////////////

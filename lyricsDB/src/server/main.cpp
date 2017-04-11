@@ -61,32 +61,31 @@ private:
 	std::mutex m_guard;
 	std::unordered_map<std::string, std::unordered_map<std::string, std::string>> m_authors;
 };
-using database_ptr = std::shared_ptr<database>;
 
 struct client_request_visitor: public request_visitor {
-	explicit client_request_visitor(database_ptr db)
-		: database(db)
+	explicit client_request_visitor(database & d)
+		: db(d)
 	{}
 
 	void visit(get_song_list_request & request) override
 	{
-		message = std::make_shared<get_song_list_response>(database->get_song_list(request.get_author()));
+		msg = std::make_shared<get_song_list_response>(db.get_song_list(request.get_author()));
 	}
 
 	void visit(get_song_request & request) override
 	{
-		message = std::make_shared<get_song_response>(
-			database->get_song(request.get_author(), request.get_song()));
+		msg = std::make_shared<get_song_response>(
+			db.get_song(request.get_author(), request.get_song()));
 	}
 
 	void visit(add_song_request & request) override
 	{
-		database->add_song(request.get_author(), request.get_song(), request.get_text());
-		message = std::make_shared<add_song_response>("OK");
+		db.add_song(request.get_author(), request.get_song(), request.get_text());
+		msg = std::make_shared<add_song_response>("OK");
 	}
 
-	message_ptr message;
-	database_ptr database;
+	message_ptr msg;
+	database & db;
 };
 
 int main(int argc, char * argv[])
@@ -116,16 +115,16 @@ int main(int argc, char * argv[])
 
 	auto ssocket = make_server_socket(hostname, port);
 
-	database_ptr database;
-	std::cerr << "server started on port " << port;
+	database db;
+	std::cerr << "server started on port " << port << std::endl;
 	while (true) {
 		auto client = ssocket->accept_one_client();
 		std::cerr << "accepted connection, start handling it" << std::endl;
-		std::thread t([=] () {
+		std::thread t([client, &db] () {
 			auto request = recv_message(*client);
-			client_request_visitor v(database);
+			client_request_visitor v(db);
 			request->accept(v);
-			send_message(*client, v.message);
+			send_message(*client, *v.msg);
 		});
 		t.detach();
 	}

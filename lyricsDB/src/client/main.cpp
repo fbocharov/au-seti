@@ -61,18 +61,19 @@ public:
 
 	std::vector<std::string> request_get_song_list(std::string const & author)
 	{
-		auto request = std::make_shared<get_song_list_request>(author);
+		get_song_list_request request(author);
 		send_message(*m_socket, request);
 
 		auto response = recv_message(*m_socket);
-		(void) response;
+		server_response_visitor v;
+		response->accept(v);
 
-		return {};
+		return v.songs;
 	}
 
 	std::string request_get_song(std::string const & author, std::string const & song)
 	{
-		auto request = std::make_shared<get_song_request>(author, song);
+		get_song_request request(author, song);
 		send_message(*m_socket, request);
 
 		auto response = recv_message(*m_socket);
@@ -87,7 +88,7 @@ public:
 		std::string const & song,
 		std::string const & text)
 	{
-		auto request = std::make_shared<add_song_request>(author, song, text);
+		add_song_request request(author, song, text);
 		send_message(*m_socket, request);
 
 		auto response = recv_message(*m_socket);
@@ -107,7 +108,7 @@ std::string load_file(std::string const & path)
 	return { std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>() };
 }
 
-void loop(client_socket_ptr socket)
+void loop(client_socket_ptr & socket)
 {
 	std::cout << "Welcome to lyrics DB 1.0!" << std::endl;
 	std::cout << "Type `help` to see list of supported commands." << std::endl;
@@ -194,8 +195,8 @@ int main(int argc, char * argv[])
 		port = p;
 	}
 
-//	loop(make_client_socket(address, port, true));
-	loop(nullptr);
+	auto socket = make_client_socket(address, port, true);
+	loop(socket);
 
 	return 0;
 }
