@@ -21,6 +21,8 @@ class ReceiveBuffer {
 public:
 	bool empty() const;
 	bool has_free_space() const;
+
+	uint16_t get_free_space() const;
 	uint64_t get_max_packet_number() const;
 
 	void add_packet(MyCPDataPacket & packet);
@@ -65,7 +67,7 @@ public:
 private:
 	void initialize_connection(uint16_t port);
 
-	MyCPDataPacket create_packet(void const * buf, size_t size);
+	MyCPDataPacket create_data_packet(void const * buf, size_t size);
 
 private:
 	ConnectionPtr m_connection;
