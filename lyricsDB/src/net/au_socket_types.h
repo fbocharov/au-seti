@@ -18,8 +18,12 @@ struct __attribute__((packed)) MyCPHeader {
 	uint16_t m_srcPort;
 	uint16_t m_dstPort;
 
-	uint32_t m_checksum; // 0 when evaluated
+	uint16_t m_size = 0; // actual size of packet
+	uint32_t m_headerChecksum = 0;
+	uint32_t m_bodyChecksum = 0;
+
 	uint64_t m_packetNumber;
+	uint64_t m_timestamp;
 };
 
 constexpr auto MYCP_MAX_WINDOW_SIZE = std::numeric_limits<uint16_t>::max();
@@ -29,7 +33,7 @@ struct __attribute__((packed)) MyCPAckPacket {
 	uint16_t m_window;
 };
 
-constexpr auto MYCP_MAX_DATA_SIZE = 2 * 1024u;
+constexpr auto MYCP_MAX_DATA_SIZE = 1 * 1024u;
 
 struct __attribute__((packed)) MyCPDataPacket {
 	MyCPHeader m_header;

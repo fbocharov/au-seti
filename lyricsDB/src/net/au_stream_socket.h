@@ -17,45 +17,25 @@
 
 ///////////////////////////////////////////////////////////////////////////////
 
-class ReceiveBuffer {
-public:
-	bool empty() const;
-	bool has_free_space() const;
+class Connection;
+using ConnectionPtr = std::shared_ptr<Connection>;
 
-	uint16_t get_free_space() const;
-	uint64_t get_max_packet_number() const;
-
-	void add_packet(MyCPDataPacket & packet);
-	size_t read(void * buf, size_t size);
-};
-
-///////////////////////////////////////////////////////////////////////////////
-
-struct Connection {
-	int m_socket;
+struct AddrInfo {
 	uint16_t m_localPort;
+
 	sockaddr m_remoteAddr;
 	uint16_t m_remotePort;
-
-	std::atomic_ullong m_nextPacketNumber;
-
-	ReceiveBuffer m_buffer;
-	std::mutex m_bufferGuard;
-	std::condition_variable m_readEvent;
-
-	uint64_t m_timeout; // in ms
-
-	std::vector<MyCPAckPacket> m_acks;
-	std::mutex m_acksGuard;
-	std::condition_variable m_ackEvent;
 };
-using ConnectionPtr = std::shared_ptr<Connection>;
 
 ///////////////////////////////////////////////////////////////////////////////
 
 class au_stream_client_socket: public stream_client_socket, public with_descriptor {
 public:
-	au_stream_client_socket(sockaddr const& removeAddr, uint16_t remotePort, uint16_t localPort);
+	au_stream_client_socket(
+		sockaddr const& remoteAddr,
+		uint16_t remotePort,
+		uint16_t localPort,
+		bool connected = true);
 	au_stream_client_socket(std::string const & hostname, uint16_t port);
 	~au_stream_client_socket();
 
@@ -65,11 +45,7 @@ public:
 	void recv(void * buf, size_t size) override;
 
 private:
-	void initialize_connection(uint16_t port);
-
-	MyCPDataPacket create_data_packet(void const * buf, size_t size);
-
-private:
+	AddrInfo m_address;
 	ConnectionPtr m_connection;
 };
 

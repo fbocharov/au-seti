@@ -7,11 +7,13 @@
 namespace {
 
 bool au_socket_enabled() {
-	return std::getenv("STREAM_SOCK_TYPE") == std::string("au");
+	auto sockType = std::getenv("STREAM_SOCK_TYPE");
+	return sockType && sockType == std::string("au");
 }
 
-}
+} // namespace
 
+///////////////////////////////////////////////////////////////////////////////
 
 client_socket_ptr make_client_socket(
 	std::string const& hostname,

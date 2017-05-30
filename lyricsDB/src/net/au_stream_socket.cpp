@@ -10,9 +10,12 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <queue>
 
+#include <cassert>
 #include <cstring>
-#include <netinet/in.h>
+#include <netdb.h>
+#include <netinet/ip.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/time.h>
@@ -23,6 +26,8 @@
 namespace {
 
 ///////////////////////////////////////////////////////////////////////////////
+
+constexpr auto MTU_SIZE = 1500;
 
 constexpr auto MAX_TIMEOUT = 5000ull; // 5s
 constexpr auto MIN_TIMEOUT = 10ull; // 1ms
@@ -42,10 +47,28 @@ int create_socket(bool nonblock = true)
 	return socket(AF_INET, type, IPPROTO_MYCP);
 }
 
-sockaddr create_addr(std::string const & hostname)
+sockaddr create_addr(std::string const & hostname, uint16_t port)
 {
+	addrinfo hints;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+
+	addrinfo * result = nullptr;
+	auto portStr = std::to_string(port);
+	int ret = getaddrinfo(hostname.c_str(), portStr.c_str(), &hints, &result);
+	if (ret)
+		throw socket_exception(std::string("failed to get addr info: ") + gai_strerror(ret));
+
 	sockaddr addr;
-	// TODO: implement me!!!
+	if (result->ai_addr)
+		// pick first address
+		memcpy(&addr, result->ai_addr, result->ai_addrlen);
+	else {
+		freeaddrinfo(result);
+		throw socket_exception("addr info is null");
+	}
+	freeaddrinfo(result);
+
 	return addr;
 }
 
@@ -67,321 +90,507 @@ uint32_t calculate_checksum(void const * packet, size_t size)
 	return checksum;
 }
 
+uint64_t get_now()
+{
+	auto now = std::chrono::steady_clock::now().time_since_epoch();
+	return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
-class Receiver {
-	const uint32_t STOP_EVENT_ID = std::numeric_limits<uint32_t>::max();
-
-public:
-	Receiver()
-		: m_pollFd(epoll_create(1))
-		, m_stopFd(eventfd(1, EFD_NONBLOCK))
+struct PacketIO {
+	static bool send(int socket, AddrInfo const & addr, MyCPDataPacket & packet)
 	{
-		if (m_pollFd < 0)
-			throw socket_exception("failed to create epoll descriptor");
-		if (m_stopFd < 0)
-			throw socket_exception("failed to create control descriptor");
+		packet.m_header.m_srcPort = addr.m_localPort;
+		packet.m_header.m_dstPort = addr.m_remotePort;
 
-		add_read_socket(STOP_EVENT_ID, m_stopFd);
+		packet.m_header.m_size = sizeof(packet);
+		packet.m_header.m_headerChecksum = calculate_checksum(&packet.m_header, sizeof(packet.m_header));
+		packet.m_header.m_bodyChecksum = calculate_checksum(packet.m_data, MYCP_MAX_DATA_SIZE);
+		packet.m_header.m_bodyChecksum += calculate_checksum(&packet.m_size, sizeof(packet.m_size));
 
-		std::thread t(std::bind(&Receiver::receive_loop, this));
-		t.detach();
+		return do_send(socket, addr, &packet, sizeof(packet));
 	}
 
-	~Receiver()
+	static bool send(int socket, AddrInfo const & addr, MyCPAckPacket & ack)
 	{
-		notify(m_stopFd);
+		ack.m_header.m_srcPort = addr.m_localPort;
+		ack.m_header.m_dstPort = addr.m_remotePort;
+
+		ack.m_header.m_size = sizeof(ack);
+		ack.m_header.m_headerChecksum = calculate_checksum(&ack.m_header, sizeof(ack.m_header));
+		ack.m_header.m_bodyChecksum += calculate_checksum(&ack.m_window, sizeof(ack.m_window));
+
+		return do_send(socket, addr, &ack, sizeof(ack));
 	}
 
-	void register_connection(uint32_t id, ConnectionPtr connection)
+	static bool receive(
+		int socket,
+		AddrInfo const & addr,
+		MyCPHeader * header,
+		uint8_t * bytes)
 	{
-		add_read_socket(id, connection->m_socket);
+		char buf[MTU_SIZE];
+		sockaddr recvAddr;
+		socklen_t recvAddrLen;
+		while (true) {
+			ssize_t recvSize = recvfrom(socket, buf, MTU_SIZE, 0, &recvAddr, &recvAddrLen);
+			if (recvSize < 0) {
+				if (EAGAIN == errno || EWOULDBLOCK == errno)
+					return false;
+				throw socket_exception("failed to receive data: " + std::string(strerror(errno)));
+			}
 
-		std::lock_guard<std::mutex> lock(m_connectionsGuard);
-		m_connections[id] = connection;
-	}
+			sockaddr_in * expected = (sockaddr_in *) &addr.m_remoteAddr;
+			sockaddr_in * actual = (sockaddr_in *) &addr.m_remoteAddr;
+			if (expected->sin_addr.s_addr != actual->sin_addr.s_addr)
+				continue;
 
-	void unregister_connection(uint32_t id)
-	{
-		// XXX: called after closing connection, no need to delete it from epoll
-		std::lock_guard<std::mutex> lock(m_connectionsGuard);
-		m_connections.erase(id);
+			size_t ipSize = sizeof(ip);
+			memcpy(bytes, buf + ipSize, MTU_SIZE - ipSize);
+			header = (MyCPHeader *) bytes;
+			if (header->m_dstPort != addr.m_localPort)
+				continue;
+
+			if (!check_integrity(header, bytes))
+				continue;
+
+			return true;
+		}
 	}
 
 private:
-	void add_read_socket(uint32_t id, int sockfd)
+	static bool do_send(int socket, AddrInfo const & addr, void * bytes, size_t size)
 	{
-		epoll_event event = {0};
-		event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
-		event.data.u32 = id;
-		if (epoll_ctl(m_pollFd, EPOLL_CTL_ADD, sockfd, &event) < 0)
-			throw socket_exception("failed to add connection to epoll");
+		ssize_t ret = sendto(socket, bytes, size, 0, &addr.m_remoteAddr, sizeof(addr.m_remoteAddr));
+		if (ret < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return false;
+			throw socket_exception("failed to send data: " + std::string(strerror(errno)));
+		}
+
+		return size_t(ret) == size;
 	}
 
-	void receive_loop()
+	static bool check_integrity(MyCPHeader * header, uint8_t * bytes)
+	{
+		uint32_t headerChecksum = header->m_headerChecksum;
+		uint32_t bodyChecksum = header->m_bodyChecksum;
+		header->m_headerChecksum = 0;
+		header->m_bodyChecksum = 0;
+
+		if (headerChecksum != calculate_checksum(header, sizeof(*header)))
+			return false;
+
+		uint8_t * body = bytes + sizeof(*header);
+		if (bodyChecksum != calculate_checksum(body, header->m_size - sizeof(*header)))
+			return false;
+
+		header->m_headerChecksum = headerChecksum;
+		header->m_bodyChecksum = bodyChecksum;
+
+		return true;
+	}
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+class ReceiveBuffer {
+public:
+	explicit ReceiveBuffer(uint32_t maxSize)
+		: m_nextPacket(0)
+		, m_packetOffset(0)
+		, m_maxSize(maxSize)
+	{}
+
+	bool empty() const
+	{
+		return m_packets.end() == m_packets.find(m_nextPacket);
+	}
+
+	bool has_free_space() const
+	{
+		return m_packets.size() < m_maxSize;
+	}
+
+	uint16_t get_free_space() const
+	{
+		return (m_maxSize - m_packets.size()) * MYCP_MAX_DATA_SIZE;
+	}
+
+	void add_packet(MyCPDataPacket & packet)
+	{
+		if (m_packets.find(packet.m_header.m_packetNumber) == m_packets.end())
+			m_packets[packet.m_header.m_packetNumber] = packet;
+	}
+
+	size_t read(void * buf, size_t size)
+	{
+		size_t readSize = 0;
+		uint8_t * data = (uint8_t *) buf;
+		auto it = m_packets.find(m_nextPacket);
+		while (it != m_packets.end() && readSize < size) {
+			size_t leftInPacket = MYCP_MAX_DATA_SIZE - m_packetOffset;
+			size_t needRead = size > leftInPacket ? leftInPacket : size;
+			memcpy(data, it->second.m_data, needRead);
+
+			data += needRead;
+			size -= needRead;
+			m_packetOffset = (m_packetOffset + needRead) % MYCP_MAX_DATA_SIZE;
+
+			if (!m_packetOffset) {
+				// read full packet
+				m_packets.erase(m_nextPacket);
+				it = m_packets.find(++m_nextPacket);
+			}
+		}
+
+		return readSize;
+	}
+
+private:
+	std::unordered_map<uint64_t, MyCPDataPacket> m_packets;
+	uint64_t m_nextPacket;
+	uint64_t m_packetOffset; // offset in current packet
+
+	uint32_t const m_maxSize;
+};
+
+} // namespace
+
+///////////////////////////////////////////////////////////////////////////////
+
+constexpr auto MAX_SEND_QUEUE_SIZE = 128;
+constexpr auto MAX_PACKETS_COUNT = MAX_SEND_QUEUE_SIZE;
+
+class NetworkManager;
+
+class Connection {
+public:
+	Connection(int socket, AddrInfo const & addr)
+		: m_socket(socket)
+		, m_address(addr)
+		, m_buffer(MAX_PACKETS_COUNT)
+	{}
+
+	void read(void * buf, size_t size)
+	{
+		std::unique_lock<std::mutex> lock(m_bufferGuard);
+		uint8_t * data = (uint8_t *) buf;
+		while (size > 0) {
+			while (m_buffer.empty())
+				m_readEvent.wait(lock);
+
+			size_t readSize = m_buffer.read(data, size);
+			size -= readSize;
+			data += readSize;
+		}
+	}
+
+	void write(void const * buf, size_t size)
+	{
+		MyCPDataPacket packet;
+		std::unique_lock<std::mutex> lock(m_sendQGuard);
+		uint8_t * data = (uint8_t *) buf;
+		while (size > 0) {
+			while (m_sendQueue.size() == MAX_SEND_QUEUE_SIZE)
+				m_sendEvent.wait(lock);
+
+			packet.m_size = size > MYCP_MAX_DATA_SIZE ? MYCP_MAX_DATA_SIZE : size;
+			memcpy(packet.m_data, data, packet.m_size);
+			m_sendQueue.push(packet);
+
+			data += packet.m_size;
+			size -= packet.m_size;
+		}
+	}
+
+private:
+	int m_socket;
+	AddrInfo m_address;
+
+	std::queue<MyCPDataPacket> m_sendQueue;
+	std::mutex m_sendQGuard;
+	std::condition_variable m_sendEvent;
+	uint64_t m_nextPacketNum = 0;
+
+	std::list<MyCPDataPacket> m_sentPackets;
+
+	uint64_t m_timeout = DEFAULT_TIMEOUT;
+	uint32_t m_maxSentPackets = 1;
+	uint16_t m_receiverWindow = MYCP_MAX_WINDOW_SIZE;
+
+	ReceiveBuffer m_buffer;
+	std::mutex m_bufferGuard;
+	std::condition_variable m_readEvent;
+
+	std::queue<MyCPAckPacket> m_acks;
+
+	friend class NetworkManager;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+class NetworkManager {
+public:
+	NetworkManager()
+		: m_pollFd(::epoll_create(1))
+		, m_stopFd(::eventfd(1, EFD_NONBLOCK))
+	{
+		if (m_pollFd < 0)
+			throw std::runtime_error("failed to create epoll");
+
+		if (m_stopFd < 0)
+			throw std::runtime_error("failed to create control descriptor");
+		add_socket(m_stopFd);
+
+		std::thread t(std::bind(&NetworkManager::main_loop, this));
+		t.detach();
+	}
+
+	ConnectionPtr register_connection(int socket, AddrInfo const & addr)
+	{
+		assert(socket >= 0);
+
+		std::lock_guard<std::mutex> lock(m_connectionsGuard);
+		auto it = m_connections.emplace(socket, std::make_shared<Connection>(socket, addr));
+		add_socket(socket, true);
+		return it.first->second;
+	}
+
+	void unregister_connection(int socket)
+	{
+		std::lock_guard<std::mutex> lock(m_connectionsGuard);
+		m_connections.erase(socket);
+	}
+
+private:
+	void main_loop()
 	{
 		while (true) {
 			std::vector<epoll_event> events(MAX_SOCKET_COUNT);
-			int readyEvents = epoll_wait(m_pollFd, &events[0], MAX_SOCKET_COUNT, -1);
+			int timeout = get_timeout();
+			int readyEvents = epoll_wait(m_pollFd, &events[0], MAX_SOCKET_COUNT, timeout);
 			if (readyEvents < 0)
-				throw socket_exception(std::string("error while polling sockets: ") + strerror(errno));
+				throw std::runtime_error("failed to poll sockets: " + std::string(strerror(errno)));
 
 			std::lock_guard<std::mutex> lock(m_connectionsGuard);
 			for (int i = 0; i < readyEvents; ++i) {
-				auto id = events[i].data.u32;
-				if (id == STOP_EVENT_ID)
+				auto& event = events[i];
+
+				if (event.data.u32 == uint32_t(m_stopFd))
 					return;
 
-				auto it = m_connections.find(id);
+				auto it = m_connections.find(event.data.u32);
 				if (it == m_connections.end())
-					// message for unknown connection, just drop it
 					continue;
-				auto connection = it->second;
 
-				{
-					std::lock_guard<std::mutex> bufferLock(connection->m_bufferGuard);
-					if (!connection->m_buffer.has_free_space())
-						// no place to put new data, do nothing
-						continue;
-
-					uint64_t prevMaxNum = connection->m_buffer.get_max_packet_number();
-					while (connection->m_buffer.has_free_space()) {
-						// read all packets from this socket and try to sent ack
-						if (!recv_packet(connection))
-							break;
-					}
-
-					uint64_t maxNum = connection->m_buffer.get_max_packet_number();
-					if (prevMaxNum != maxNum) {
-						send_ack(connection, maxNum, connection->m_buffer.get_free_space());
-						connection->m_readEvent.notify_one();
-					}
+				if (event.events & EPOLLRDHUP) {
+					// TODO: set closed flag
 				}
 
-				{
-					std::lock_guard<std::mutex> ackLock(connection->m_acksGuard);
-					if (!connection->m_acks.empty())
-						connection->m_ackEvent.notify_one();
+				auto connection = it->second;
+				if (event.events & EPOLLIN) {
+					do_reads(connection);
+				}
+
+				if (event.events & EPOLLOUT) {
+					do_writes(connection);
 				}
 			}
 		}
 	}
 
-	void notify(int descriptor)
+	void do_reads(ConnectionPtr connection)
 	{
-		uint8_t num = 1;
-		write(descriptor, &num, sizeof(num));
+		uint16_t window = MYCP_MAX_DATA_SIZE;
+		uint64_t maxAckedNum = 0;
+		bool readAck = false;
+
+		std::lock_guard<std::mutex> lock(connection->m_bufferGuard);
+		uint8_t bytes[MTU_SIZE];
+		MyCPHeader header;
+		while (PacketIO::receive(connection->m_socket, connection->m_address, &header, bytes)) {
+			switch (header.m_type) {
+				case MyCPMessageType::MyCP_ACK: {
+					MyCPAckPacket ack = to_ack(bytes);
+					maxAckedNum = ack.m_header.m_packetNumber;
+					window = std::min(window, ack.m_window);
+					readAck = true;
+					break;
+				}
+				case MyCPMessageType::MyCP_DATA: {
+					MyCPDataPacket packet = to_data(bytes);
+					if (connection->m_buffer.has_free_space()) {
+						connection->m_buffer.add_packet(packet);
+
+						MyCPAckPacket ack;
+						ack.m_header.m_type = MyCPMessageType::MyCP_ACK;
+						ack.m_header.m_packetNumber = packet.m_header.m_packetNumber;
+						ack.m_header.m_timestamp = packet.m_header.m_timestamp;
+						ack.m_window = connection->m_buffer.get_free_space();
+						connection->m_acks.push(ack);
+					}
+					break;
+				}
+				default: break;
+			}
+		}
+
+		if (readAck) {
+			connection->m_receiverWindow = window;
+			// can calculate RTT?
+			for (auto it = connection->m_sentPackets.begin(); connection->m_sentPackets.end() != it; )
+				if (it->m_header.m_packetNumber <= maxAckedNum)
+					it = connection->m_sentPackets.erase(it);
+				else
+					++it;
+		}
+
+		if (!connection->m_buffer.empty())
+			connection->m_readEvent.notify_one();
 	}
 
-	void send_ack(ConnectionPtr connection, uint64_t ackNum, uint16_t freeSpace)
+	void do_writes(ConnectionPtr connection)
 	{
-		MyCPAckPacket packet;
+		int socket = connection->m_socket;
+		auto const & addr = connection->m_address;
 
-		packet.m_header.m_type = MyCPMessageType::MyCP_ACK;
-		packet.m_header.m_srcPort = connection->m_localPort;
-		packet.m_header.m_dstPort = connection->m_remotePort;
-		packet.m_header.m_packetNumber = ackNum;
+		// retransmit
+		auto now = get_now();
+		bool hasTimedoutPackets = false;
+		for (auto& packet: connection->m_sentPackets) {
+			if (packet.m_header.m_timestamp + connection->m_timeout > now)
+				continue;
 
-		packet.m_window = freeSpace;
+			hasTimedoutPackets = true;
+			packet.m_header.m_timestamp = now;
+			if (!PacketIO::send(socket, addr, packet))
+				break;
+		}
+		if (hasTimedoutPackets)
+			connection->m_maxSentPackets /= 2;
+		else
+			connection->m_maxSentPackets += 1;
 
-		packet.m_header.m_checksum = calculate_checksum(&packet, sizeof(packet));
+		// send acks
+		while (!connection->m_acks.empty()) {
+			auto& ack = connection->m_acks.front();
+			if (!PacketIO::send(socket, addr, ack))
+				break;
+			connection->m_acks.pop();
+		}
 
-		uint8_t * serialized = nullptr;
-		while (true) {
-			ssize_t ret = sendto(connection->m_socket, serialized, sizeof(packet),
-								 0, &connection->m_remoteAddr, sizeof(connection->m_remoteAddr));
-			if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
-				throw socket_exception("failed to send data: " + std::string(strerror(errno)));
+		// send packets
+		{
+			std::unique_lock<std::mutex> lock(connection->m_sendQGuard);
+			while (!connection->m_sendQueue.empty()) {
+				if (connection->m_sentPackets.size() >= connection->m_maxSentPackets)
+					break;
+
+				auto& packet = connection->m_sendQueue.front();
+				packet.m_header.m_type = MyCPMessageType::MyCP_DATA;
+				packet.m_header.m_packetNumber = connection->m_nextPacketNum++;
+				packet.m_header.m_timestamp = get_now();
+				if (!PacketIO::send(socket, addr, packet))
+					break;
+				connection->m_sentPackets.push_back(packet);
+				connection->m_sendQueue.pop();
+			}
+
+			if (connection->m_sendQueue.size() < MAX_SEND_QUEUE_SIZE)
+				connection->m_sendEvent.notify_one();
 		}
 	}
 
-	// XXX: called with locked connection->m_bufferGuard
-	bool recv_packet(ConnectionPtr connection)
+	MyCPAckPacket to_ack(uint8_t * bytes)
 	{
-		return false;
+		MyCPAckPacket packet;
+		memcpy(&packet, bytes, sizeof(packet));
+		return packet;
+	}
+
+	MyCPDataPacket to_data(uint8_t * bytes)
+	{
+		MyCPDataPacket packet;
+		memcpy(&packet, bytes, sizeof(packet));
+		return packet;
+	}
+
+	void add_socket(int socket, bool checkWrite = false)
+	{
+		epoll_event event{0};
+		event.data.u32 = socket;
+		event.events = EPOLLOUT | EPOLLRDHUP;
+		if (checkWrite)
+			event.events |= EPOLLIN;
+
+		if (epoll_ctl(m_pollFd, EPOLL_CTL_ADD, socket, &event) < 0)
+			throw std::runtime_error("failed to add socket to epoll");
+	}
+
+	int get_timeout()
+	{
+		std::lock_guard<std::mutex> lock(m_connectionsGuard);
+		int timeout = -1;
+		for (auto it: m_connections)
+			timeout = std::min(timeout, int(it.second->m_timeout));
+		return timeout;
 	}
 
 private:
 	int m_pollFd;
 	int m_stopFd;
 
-	std::unordered_map<uint32_t, ConnectionPtr> m_connections;
+	std::unordered_map<int, ConnectionPtr> m_connections;
 	std::mutex m_connectionsGuard;
 };
 
-Receiver receiver;
-
-} // namespace
-
-///////////////////////////////////////////////////////////////////////////////
-
-bool ReceiveBuffer::empty() const
-{
-	// TODO: implement me!
-	return true;
-}
-
-bool ReceiveBuffer::has_free_space() const
-{
-	// TODO: implement me!
-	return false;
-}
-
-uint16_t ReceiveBuffer::get_free_space() const
-{
-	// TODO: implement me!
-	return 0;
-}
-
-uint64_t ReceiveBuffer::get_max_packet_number() const
-{
-	// TODO: implement me!
-	return 0;
-}
-
-void ReceiveBuffer::add_packet(MyCPDataPacket & packet)
-{
-	(void) packet;
-	// TODO: implement me!
-}
-
-size_t ReceiveBuffer::read(void * buf, size_t size)
-{
-	(void) buf;
-	(void) size;
-	// TODO: implement me!
-	return 0;
-}
-
+static NetworkManager manager;
 
 ///////////////////////////////////////////////////////////////////////////////
 
 au_stream_client_socket::au_stream_client_socket(
-		sockaddr const & removeAddr,
+		sockaddr const & remoteAddr,
 		uint16_t remotePort,
-		uint16_t localPort)
+		uint16_t localPort,
+		bool connected)
 	: with_descriptor(create_socket())
-	, m_connection(std::make_shared<Connection>())
 {
-	m_connection->m_socket = m_descriptor;
-	m_connection->m_localPort = localPort;
+	m_address.m_localPort = localPort;
+	m_address.m_remoteAddr = remoteAddr;
+	m_address.m_remotePort = remotePort;
 
-	m_connection->m_remoteAddr = removeAddr;
-	m_connection->m_remotePort = remotePort;
+	if (connected)
+		m_connection = manager.register_connection(m_descriptor, m_address);
 }
 
 au_stream_client_socket::au_stream_client_socket(std::string const & hostname, uint16_t port)
-	: au_stream_client_socket(create_addr(hostname), port, get_random_port())
+	: au_stream_client_socket(create_addr(hostname, port), port, get_random_port(), false)
 {}
 
 au_stream_client_socket::~au_stream_client_socket()
 {
-	// TODO: send close message
-	close(m_connection->m_socket);
-	receiver.unregister_connection(m_connection->m_socket);
+	manager.unregister_connection(m_descriptor);
 }
 
 void au_stream_client_socket::connect()
 {
-	// TODO: connect
+	if (m_connection)
+		throw socket_exception("socket already connected");
+
+	// TODO: send connect messages
+	m_connection = manager.register_connection(m_descriptor, m_address);
 }
 
 void au_stream_client_socket::send(void const * buf, size_t size)
 {
-	uint16_t window = MYCP_MAX_WINDOW_SIZE;
-	uint16_t maxSentPacketsCount = 0;
-
-	size_t packedOffset = 0;
-	std::list<MyCPDataPacket> notAckedPackets;
-	while (packedOffset < size && !notAckedPackets.empty()) {
-		if (notAckedPackets.empty()) {
-			maxSentPacketsCount += 1;
-		} else {
-			maxSentPacketsCount /= 2;
-		}
-
-		uint16_t sentPacketCount = 0;
-		while (window > 0 && sentPacketCount <= maxSentPacketsCount) {
-			size_t packetSize = window > MYCP_MAX_DATA_SIZE ? MYCP_MAX_DATA_SIZE : window;
-			auto packet = create_data_packet((uint8_t*) buf + packedOffset, packetSize);
-			notAckedPackets.push_back(packet);
-
-			packedOffset += packetSize;
-			window -= packetSize;
-			sentPacketCount += 1;
-		}
-
-		for (auto const& packet: notAckedPackets) {
-			(void) packet;
-			// TODO: send packet
-		}
-
-		uint64_t maxAck = 0;
-		{
-			std::unique_lock<std::mutex> lock(m_connection->m_acksGuard);
-			std::cv_status st = std::cv_status::no_timeout;
-			while (m_connection->m_acks.empty())
-				st = m_connection->m_ackEvent.wait_for(lock, std::chrono::milliseconds(m_connection->m_timeout));
-
-			if (st == std::cv_status::no_timeout) {
-				for (auto const& ack: m_connection->m_acks) {
-					if (ack.m_header.m_packetNumber > maxAck) {
-						maxAck = ack.m_header.m_packetNumber;
-						window = std::max(window, ack.m_window);
-					}
-				}
-			}
-		}
-		for (auto it = notAckedPackets.begin(); it != notAckedPackets.end(); )
-			if (it->m_header.m_packetNumber <= maxAck)
-				it = notAckedPackets.erase(it);
-			else
-				++it;
-	}
+	m_connection->write(buf, size);
 }
 
 void au_stream_client_socket::recv(void * buf, size_t size)
 {
-	std::unique_lock<std::mutex> lock(m_connection->m_bufferGuard);
-
-	uint8_t * data = (uint8_t *) buf;
-	while (size > 0) {
-		while (m_connection->m_buffer.empty())
-			m_connection->m_readEvent.wait(lock);
-
-		size_t readSize = m_connection->m_buffer.read(data, size);
-		size -= readSize;
-		data += readSize;
-	}
-}
-
-void au_stream_client_socket::initialize_connection(uint16_t port)
-{
-	m_connection->m_socket = m_descriptor;
-	m_connection->m_localPort = port;
-	m_connection->m_timeout = DEFAULT_TIMEOUT;
-
-	receiver.register_connection(m_connection->m_socket, m_connection);
-}
-
-MyCPDataPacket au_stream_client_socket::create_data_packet(void const * buf, size_t size)
-{
-	if (size > MYCP_MAX_DATA_SIZE)
-		throw socket_exception("packet data size is too big");
-
-	MyCPDataPacket packet;
-
-	packet.m_header.m_srcPort = m_connection->m_localPort;
-	packet.m_header.m_dstPort = m_connection->m_remotePort;
-	packet.m_header.m_type = MyCPMessageType::MyCP_DATA;
-	packet.m_header.m_packetNumber = m_connection->m_nextPacketNumber++;
-
-	memcpy(packet.m_data, buf, size);
-	packet.m_size = size;
-
-	packet.m_header.m_checksum = calculate_checksum(&packet, sizeof(packet));
-
-	return packet;
+	m_connection->read(buf, size);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
