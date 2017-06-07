@@ -35,7 +35,7 @@ public:
 		sockaddr const& remoteAddr,
 		uint16_t remotePort,
 		uint16_t localPort,
-		bool connected = true);
+		bool connected);
 	au_stream_client_socket(std::string const & hostname, uint16_t port);
 	~au_stream_client_socket();
 
@@ -56,5 +56,8 @@ public:
 	explicit au_stream_server_socket(std::string const & hostname, uint16_t port);
 
 	socket_ptr accept_one_client() override;
+
+private:
+	AddrInfo m_address;
 };
 

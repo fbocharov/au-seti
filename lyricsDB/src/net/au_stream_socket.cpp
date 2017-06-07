@@ -22,6 +22,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 namespace {
 
@@ -124,6 +125,29 @@ struct PacketIO {
 		return do_send(socket, addr, &ack, sizeof(ack));
 	}
 
+	static bool send(int socket, AddrInfo const & addr, MyCPHeader & hdr)
+	{
+		hdr.m_srcPort = addr.m_localPort;
+		hdr.m_dstPort = addr.m_remotePort;
+
+		hdr.m_size = sizeof(hdr);
+		hdr.m_headerChecksum = calculate_checksum(&hdr, sizeof(hdr));
+		hdr.m_bodyChecksum = 0;
+
+		return do_send(socket, addr, &hdr, sizeof(hdr));
+
+	}
+
+	static bool receiveAny(
+		int socket,
+		uint16_t port,
+		sockaddr * remoteAddr,
+		MyCPHeader * header,
+		uint8_t * bytes)
+	{
+		return false;
+	}
+
 	static bool receive(
 		int socket,
 		AddrInfo const & addr,
@@ -170,6 +194,29 @@ private:
 		}
 
 		return size_t(ret) == size;
+	}
+
+	static bool do_receive(
+			int socket,
+			uint16_t port,
+			sockaddr * addr,
+			MyCPHeader * header,
+			uint8_t * bytes)
+	{
+		char buf[MTU_SIZE];
+		socklen_t addrLen;
+		ssize_t recvSize = recvfrom(socket, buf, MTU_SIZE, 0, addr, &addrLen);
+		if (recvSize < 0) {
+			if (EAGAIN == errno || EWOULDBLOCK == errno)
+				return false;
+			throw socket_exception("failed to receive data: " + std::string(strerror(errno)));
+		}
+
+		size_t ipSize = sizeof(ip);
+		memcpy(bytes, buf + ipSize, MTU_SIZE - ipSize);
+		header = (MyCPHeader *) bytes;
+
+		return header->m_dstPort == port && check_integrity(header, bytes);
 	}
 
 	static bool check_integrity(MyCPHeader * header, uint8_t * bytes)
@@ -270,6 +317,7 @@ public:
 	Connection(int socket, AddrInfo const & addr)
 		: m_socket(socket)
 		, m_address(addr)
+		, m_isClosed(false)
 		, m_buffer(MAX_PACKETS_COUNT)
 	{}
 
@@ -280,6 +328,9 @@ public:
 		while (size > 0) {
 			while (m_buffer.empty())
 				m_readEvent.wait(lock);
+
+			if (m_isClosed)
+				throw socket_exception("peer closed connection");
 
 			size_t readSize = m_buffer.read(data, size);
 			size -= readSize;
@@ -308,6 +359,8 @@ public:
 private:
 	int m_socket;
 	AddrInfo m_address;
+
+	std::atomic_bool m_isClosed;
 
 	std::queue<MyCPDataPacket> m_sendQueue;
 	std::mutex m_sendQGuard;
@@ -385,11 +438,11 @@ private:
 				if (it == m_connections.end())
 					continue;
 
+				auto connection = it->second;
 				if (event.events & EPOLLRDHUP) {
-					// TODO: set closed flag
+					connection->m_isClosed = true;
 				}
 
-				auto connection = it->second;
 				if (event.events & EPOLLIN) {
 					do_reads(connection);
 				}
@@ -555,7 +608,7 @@ au_stream_client_socket::au_stream_client_socket(
 		uint16_t remotePort,
 		uint16_t localPort,
 		bool connected)
-	: with_descriptor(create_socket())
+	: with_descriptor(create_socket(connected))
 {
 	m_address.m_localPort = localPort;
 	m_address.m_remoteAddr = remoteAddr;
@@ -579,7 +632,28 @@ void au_stream_client_socket::connect()
 	if (m_connection)
 		throw socket_exception("socket already connected");
 
-	// TODO: send connect messages
+	MyCPHeader hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.m_type = MyCPMessageType::MyCP_SYN;
+	if (!PacketIO::send(m_descriptor, m_address, hdr))
+		throw socket_exception("failed to connect: unknown error 1");
+
+	memset(&hdr, 0, sizeof(hdr));
+	uint8_t bytes[MTU_SIZE];
+	if (!PacketIO::receive(m_descriptor, m_address, &hdr, bytes))
+		throw socket_exception("failed to connect: unknown error 2");
+
+	if (hdr.m_type != MyCPMessageType::MyCP_SYNACK)
+		throw socket_exception("failed to connect: unknown peer response");
+
+	int flags = fcntl(m_descriptor, F_GETFL, 0);
+	if (flags < 0)
+		throw socket_exception("failed to connect: can't get socket state");
+
+	flags |= O_NONBLOCK;
+	if (fcntl(m_descriptor, F_SETFL, flags) < 0)
+		throw socket_exception("failed to connect: can't set socket state");
+
 	m_connection = manager.register_connection(m_descriptor, m_address);
 }
 
@@ -597,10 +671,32 @@ void au_stream_client_socket::recv(void * buf, size_t size)
 
 au_stream_server_socket::au_stream_server_socket(std::string const & hostname, uint16_t port)
 	: with_descriptor(create_socket(false))
-{}
+{
+	m_address.m_localPort = port;
+}
 
 socket_ptr au_stream_server_socket::accept_one_client()
 {
-	// TODO: implement me!!
-	return nullptr;
+	uint8_t bytes[MTU_SIZE];
+	while (true) {
+		MyCPHeader hdr;
+		sockaddr addr;
+		if (!PacketIO::receiveAny(m_descriptor, m_address.m_localPort, &addr, &hdr, bytes)) {
+			throw socket_exception("failed to accept: unknown error 1");
+		}
+
+		if (hdr.m_type != MyCPMessageType::MyCP_SYN)
+			continue;
+
+		AddrInfo remoteAddr;
+		remoteAddr.m_localPort = m_address.m_localPort;
+		remoteAddr.m_remoteAddr = addr;
+		remoteAddr.m_remotePort = hdr.m_srcPort;
+
+		hdr.m_type = MyCPMessageType::MyCP_SYNACK;
+		if (!PacketIO::send(m_descriptor, remoteAddr, hdr))
+			throw socket_exception("failed to accept: can't send ack");
+
+		return std::make_shared<au_stream_client_socket>(addr, remoteAddr.m_localPort, remoteAddr.m_remotePort, true);
+	}
 }
